@@ -13,12 +13,13 @@ export const authMiddleware = (req, res, next) => {
   try {
     const decoded = jwt.verify(token, getAccessSecret());
 
-    if (!decoded || !decoded.id) {
+    const userId = decoded.id || decoded.userId;
+    if (!decoded || !userId) {
       return res.status(401).json({ success: false, message: "Invalid token payload", code: "INVALID_PAYLOAD" });
     }
 
     req.user = {
-      id: decoded.id,
+      id: userId,
       email: decoded.email || null,
       role: decoded.role || "user",
     };
