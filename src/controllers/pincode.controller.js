@@ -1,5 +1,4 @@
 import Pincode from "../models/pincode.models.js";
-import Village from "../models/village.model.js";
 import redisClient from "../config/redis.js";
 import { logger } from "../utils/logger.js";
 
@@ -37,30 +36,6 @@ const fetchFromPostalAPI = async (pincode) => {
   }
 };
 
-const seedVillagesForPincode = async (pincode, postOffices) => {
-  try {
-    const existingCount = await Village.countDocuments({ pincode });
-    if (existingCount > 0) return;
-
-    const villageDocs = postOffices
-      .filter((po) => po.Name)
-      .map((po) => ({
-        pincode,
-        name: po.Name,
-        branchType: po.BranchType || "",
-        deliveryStatus: po.DeliveryStatus || "Delivery",
-        isDeliveryAllowed: po.DeliveryStatus === "Delivery",
-      }));
-
-    if (villageDocs.length > 0) {
-      await Village.insertMany(villageDocs, { ordered: false });
-      logger.info(`Seeded ${villageDocs.length} villages for pincode ${pincode}`);
-    }
-  } catch (err) {
-    logger.warn(`Failed to seed villages for ${pincode}: ${err.message}`);
-  }
-};
-
 const formatPincode = (pin) => ({
   _id: pin._id,
   pincode: pin.pincode,
@@ -91,6 +66,24 @@ export const checkPincode = async (req, res) => {
     let pin = await Pincode.findOne({ pincode });
 
     if (pin) {
+      const needsRefresh = !pin.city || pin.estimatedDays === "3-5";
+      if (needsRefresh) {
+        const postalResult = await fetchFromPostalAPI(pincode);
+        if (postalResult.valid) {
+          const updates = { lastVerifiedAt: new Date() };
+          if (!pin.city) {
+            updates.city = postalResult.city;
+            updates.state = postalResult.state;
+            updates.district = postalResult.district;
+            updates.area = postalResult.area;
+          }
+          if (pin.estimatedDays === "3-5") {
+            updates.estimatedDays = DEFAULT_ESTIMATED_DAYS;
+          }
+          pin = await Pincode.findOneAndUpdate({ pincode }, { $set: updates }, { new: true });
+          logger.info(`Refreshed stale pincode data for ${pincode}`, updates);
+        }
+      }
       await redisClient.setEx(getCacheKey(pincode), CACHE_TTL, JSON.stringify(pin));
       return res.json(formatPincode(pin));
     }
@@ -120,10 +113,6 @@ export const checkPincode = async (req, res) => {
 
     await redisClient.setEx(getCacheKey(pincode), CACHE_TTL, JSON.stringify(newPin));
     logger.info(`Pincode auto-seeded via India Post: ${pincode}`, { city: postalResult.city, state: postalResult.state });
-
-    if (postalResult?.postOffices) {
-      await seedVillagesForPincode(pincode, postalResult.postOffices);
-    }
 
     // Use 200 (not 201) so product service treats this as serviceable (checks response.status === 200)
     res.status(200).json(formatPincode(newPin));
@@ -182,21 +171,6 @@ export const addPincode = async (req, res) => {
     });
 
     await redisClient.del(getCacheKey(pincode));
-
-    const { villages: villageDeliveryData } = req.body;
-    if (Array.isArray(villageDeliveryData) && villageDeliveryData.length > 0) {
-      const villageDocs = villageDeliveryData.map((v) => ({
-        pincode,
-        name: v.name,
-        branchType: v.branchType || "",
-        deliveryStatus: v.deliveryStatus || "Delivery",
-        isDeliveryAllowed: v.isDeliveryAllowed === true,
-      }));
-      await Village.insertMany(villageDocs, { ordered: false });
-      logger.info(`Seeded ${villageDocs.length} villages with delivery settings for pincode ${pincode}`);
-    } else if (postalResult?.postOffices) {
-      await seedVillagesForPincode(pincode, postalResult.postOffices);
-    }
 
     res.status(201).json({
       success: true,
